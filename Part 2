@@ -1,0 +1,1159 @@
+Part 2 
+
+Нижче наведені варіанти, 1 з використанням Airflow, 2 з використанням Prefect 
+
+0058 160425 
+
+
+
+
+
+Нижче наведено остаточне інтегроване рішення для другої частини фінального проєкту – **Building an Batch Data Lake (FTP + Spark + Airflow)**. Це рішення містить покрокову інструкцію, а також чотири основні файли, які виконують наступні завдання:
+
+1. **landing_to_bronze.py**  
+   Завантажує CSV-файли з FTP-сервера, читає їх за допомогою Spark та зберігає у форматі Parquet (створюючи «landing zone» → bronze layer).
+
+2. **bronze_to_silver.py**  
+   Зчитує дані з bronze шару, очищає текстові колонки (за допомогою UDF) та робить дедублікацію, записуючи результати у silver layer (для athlete_bio та athlete_event_results).
+
+3. **silver_to_gold.py**  
+   Зчитує очищені дані з silver шару, виконує об’єднання (join) за ключем athlete_id, групує дані за sport, medal, sex і country_noc, обчислює середні значення (наприклад, для висоти та ваги), додає часову мітку та зберігає фінальний агрегований набір даних у gold шар (наприклад, gold/avg_stats).
+
+4. **project_solution.py**  
+   Файл з Airflow DAG, що послідовно запускає всі три Spark‑скрипти за допомогою оператора SparkSubmitOperator.
+
+Нижче подано код кожного з файлів із коментарями та подальшими діями для автоматичного виконання завдання.
+
+──────────────────────────────
+### 1. Файл: landing_to_bronze.py
+
+```python
+import requests
+from pyspark.sql import SparkSession
+
+def download_data(file_name):
+    base_url = "https://ftp.goit.study/neoversity/"
+    downloading_url = base_url + file_name + ".csv"
+    local_file = file_name + ".csv"
+    print(f"Завантаження з {downloading_url}...")
+    response = requests.get(downloading_url)
+    if response.status_code == 200:
+        with open(local_file, 'wb') as f:
+            f.write(response.content)
+        print(f"Файл {local_file} завантажено.")
+        return local_file
+    else:
+        raise Exception(f"Не вдалося завантажити {local_file}. Статус код: {response.status_code}")
+
+def main():
+    spark = SparkSession.builder.appName("LandingToBronze").getOrCreate()
+
+    # Завантаження і конвертація athlete_bio
+    bio_csv = download_data("athlete_bio")
+    df_bio = spark.read.option("header", "true").option("inferSchema", "true").csv(bio_csv)
+    bronze_bio_path = "bronze/athlete_bio.parquet"
+    df_bio.write.mode("overwrite").parquet(bronze_bio_path)
+    print(f"athlete_bio збережено у {bronze_bio_path}")
+
+    # Завантаження і конвертація athlete_event_results
+    event_csv = download_data("athlete_event_results")
+    df_events = spark.read.option("header", "true").option("inferSchema", "true").csv(event_csv)
+    bronze_event_path = "bronze/athlete_event_results.parquet"
+    df_events.write.mode("overwrite").parquet(bronze_event_path)
+    print(f"athlete_event_results збережено у {bronze_event_path}")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+```
+
+──────────────────────────────
+### 2. Файл: bronze_to_silver.py
+
+```python
+import re
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col, current_timestamp
+from pyspark.sql.types import StringType
+
+# Функція для очищення тексту
+def clean_text(text):
+    return re.sub(r'[^a-zA-Z0-9,.\\"\']', '', str(text))
+
+clean_text_udf = udf(clean_text, StringType())
+
+def main():
+    spark = SparkSession.builder.appName("BronzeToSilver").getOrCreate()
+
+    # Обробка athlete_bio
+    bronze_bio_path = "bronze/athlete_bio.parquet"
+    silver_bio_path = "silver/athlete_bio.parquet"
+    df_bio = spark.read.parquet(bronze_bio_path)
+    for col_name in df_bio.columns:
+        # Якщо колонка має тип StringType, очищаємо її
+        df_bio = df_bio.withColumn(col_name, clean_text_udf(col(col_name)))
+    df_bio = df_bio.dropDuplicates()
+    df_bio.write.mode("overwrite").parquet(silver_bio_path)
+    print(f"athlete_bio очищено і збережено у {silver_bio_path}")
+
+    # Обробка athlete_event_results
+    bronze_event_path = "bronze/athlete_event_results.parquet"
+    silver_event_path = "silver/athlete_event_results.parquet"
+    df_events = spark.read.parquet(bronze_event_path)
+    for col_name in df_events.columns:
+        df_events = df_events.withColumn(col_name, clean_text_udf(col(col_name)))
+    df_events = df_events.dropDuplicates()
+    df_events.write.mode("overwrite").parquet(silver_event_path)
+    print(f"athlete_event_results очищено і збережено у {silver_event_path}")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+```
+
+──────────────────────────────
+### 3. Файл: silver_to_gold.py
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, avg, current_timestamp, round
+
+def main():
+    spark = SparkSession.builder.appName("SilverToGold").getOrCreate()
+
+    # Зчитування даних із silver шару
+    silver_bio_path = "silver/athlete_bio.parquet"
+    silver_event_path = "silver/athlete_event_results.parquet"
+    df_bio = spark.read.parquet(silver_bio_path)
+    df_events = spark.read.parquet(silver_event_path)
+
+    # Об’єднання даних за athlete_id
+    df_joined = df_bio.join(df_events, "athlete_id")
+
+    # Агрегація даних: групування за sport, medal, sex, country_noc із обчисленням середніх значень
+    df_gold = df_joined.groupBy("sport", "medal", "sex", "country_noc") \
+        .agg(
+            round(avg("height"), 2).alias("avg_height"),
+            round(avg("weight"), 2).alias("avg_weight")
+        ) \
+        .withColumn("timestamp", current_timestamp())
+
+    gold_path = "gold/avg_stats.parquet"
+    df_gold.write.mode("overwrite").parquet(gold_path)
+    print(f"Збережено агреговані дані у gold-шарі: {gold_path}")
+    
+    # Виведення результатів на екран для перевірки
+    df_gold.show(truncate=False)
+    
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+```
+
+──────────────────────────────
+### 4. Файл: project_solution.py (Airflow DAG)
+
+```python
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'data_engineer',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 16),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
+}
+
+with DAG(
+    dag_id='batch_data_lake_pipeline',
+    default_args=default_args,
+    description='ETL pipeline for building a multi-hop Batch Data Lake using FTP, Spark, and Airflow',
+    schedule_interval=None,
+    catchup=False
+) as dag:
+
+    landing_to_bronze = SparkSubmitOperator(
+        task_id='landing_to_bronze',
+        application='/Users/ihorfranchuk/PycharmProjects/PythonProject15/landing_to_bronze.py',
+        conn_id='spark-default',
+        verbose=1,
+        execution_timeout=timedelta(minutes=10)
+    )
+
+    bronze_to_silver = SparkSubmitOperator(
+        task_id='bronze_to_silver',
+        application='/Users/ihorfranchuk/PycharmProjects/PythonProject15/bronze_to_silver.py',
+        conn_id='spark-default',
+        verbose=1,
+        execution_timeout=timedelta(minutes=10)
+    )
+
+    silver_to_gold = SparkSubmitOperator(
+        task_id='silver_to_gold',
+        application='/Users/ihorfranchuk/PycharmProjects/PythonProject15/silver_to_gold.py',
+        conn_id='spark-default',
+        verbose=1,
+        execution_timeout=timedelta(minutes=10)
+    )
+
+    landing_to_bronze >> bronze_to_silver >> silver_to_gold
+```
+
+──────────────────────────────
+### Автоматизований скрипт запуску (опційно): run_first_part.sh
+
+Цей скрипт інтегрує запуск всіх компонентів – перевіряє та запускає Kafka, а потім запускає Spark-джоби через spark-submit.
+
+```bash
+#!/bin/bash
+# ---------------------------------------
+# Скрипт для запуску першої частини Batch Data Lake Pipeline
+# ---------------------------------------
+
+echo "Запуск налаштування Apache Kafka..."
+./setup_kafka.sh
+
+# Перевірка, чи Kafka-сервер запущено (шукаємо процес KafkaServer)
+if pgrep -f "kafka.server.KafkaServer" > /dev/null; then
+    echo "Kafka-сервер вже запущено."
+else
+    echo "Запуск Kafka-серверу..."
+    cd "$HOME/kafka" || { echo "Не вдалося перейти до Kafka-директорії"; exit 1; }
+    ./bin/kafka-server-start.sh config/server.properties &
+    sleep 10
+fi
+cd - >/dev/null
+
+echo "Запуск PySpark джоб для batch data lake..."
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 streaming_pipeline.py
+```
+
+──────────────────────────────
+### Інструкції з виконання
+
+1. **Створіть проєкт у PyCharm:**  
+   Розмістіть файли:
+   - `landing_to_bronze.py`
+   - `bronze_to_silver.py`
+   - `silver_to_gold.py`
+   - `project_solution.py` (розмістіть цей файл у директорії, яку використовує Airflow для DAG‑файлів, наприклад, `~/airflow/dags`)
+   - (Опційно) `run_first_part.sh`
+   - Переконайтеся, що у каталозі проєкту є папка `jars` із файлом `mysql-connector-j-8.0.32.jar`
+   - Створіть папки `bronze`, `silver` і `gold` (скрипт може створювати їх автоматично, якщо їх немає)
+
+2. **Надайте права на виконання для bash‑скриптів (якщо потрібні):**
+   ```bash
+   cd /Users/ihorfranchuk/PycharmProjects/PythonProject15
+   chmod +x setup_kafka.sh run_first_part.sh
+   ```
+
+3. **Запустіть інтегрований скрипт:**  
+   Виконайте:
+   ```bash
+   ./run_first_part.sh
+   ```
+   або виконайте кожен скрипт окремо через PyCharm, спочатку `landing_to_bronze.py`, потім `bronze_to_silver.py`, потім `silver_to_gold.py`.
+
+4. **Перевірка результатів:**  
+   - Перегляньте вивід у консолі для кожного кроку (переконайтеся, що дані зчитані, оброблені та збережені у відповідних папках).
+   - Перевірте фінальний агрегований DataFrame, який буде записаний у gold-шар (наприклад, файли `gold/avg_stats.parquet`), а також таблицю **avg_stats** у MySQL (якщо використовується запис до бази даних).
+   - За необхідності використайте MySQL Workbench або CLI для виконання запиту:
+     ```sql
+     SELECT * FROM athlete_stats;
+     ```
+   - Перевірте граф відпрацьованого DAGу у веб-інтерфейсі Airflow (якщо ви інтегруєте рішення з Airflow).
+
+5. **Запуск Airflow DAG (для проект_solution.py):**  
+   - Переконайтеся, що Airflow запущено (використовуйте команду `airflow webserver` та `airflow scheduler`).
+   - Помістіть файл `project_solution.py` у відповідну папку DAG (наприклад, `~/airflow/dags`) і запустіть DAG через веб-інтерфейс.
+
+---
+
+### Підсумок
+
+Це рішення дозволяє автоматично завантажити дані з FTP-сервера, обробити їх через Spark (ETL: landing → bronze → silver → gold) та автоматизувати запуск через Airflow DAG. Дотримуйтеся зазначених кроків у PyCharm або Terminal для отримання очікуваних результатів згідно вимог завдання.
+
+
+
+
+0058 160425 
+
+
+
+
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % cd /Users/ihorfranchuk/PycharmProjects/PythonProject15
+chmod +x setup_kafka.sh run_first_part.sh
+
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % ./run_first_part.sh
+
+Запуск налаштування Apache Kafka...
+=== Налаштування Apache Kafka для macOS (версія 3.4.0) ===
+Завантаження Kafka з https://archive.apache.org/dist/kafka/3.4.0/kafka_2.13-3.4.0.tgz ...
+Kafka вже встановлено в /Users/ihorfranchuk/kafka
+Запуск ZooKeeper...
+ZooKeeper успішно запущено.
+----------------------------------------
+Для запуску Kafka-серверу скористайтеся командою:
+  cd /Users/ihorfranchuk/kafka && ./bin/kafka-server-start.sh config/server.properties
+----------------------------------------
+Запуск Kafka-серверу...
+[2025-04-16 00:57:07,455] INFO Registered kafka:type=kafka.Log4jController MBean (kafka.utils.Log4jControllerRegistration$)
+[2025-04-16 00:57:07,565] INFO Setting -D jdk.tls.rejectClientInitiatedRenegotiation=true to disable client-initiated TLS renegotiation (org.apache.zookeeper.common.X509Util)
+[2025-04-16 00:57:07,603] INFO Registered signal handlers for TERM, INT, HUP (org.apache.kafka.common.utils.LoggingSignalHandler)
+[2025-04-16 00:57:07,603] INFO starting (kafka.server.KafkaServer)
+[2025-04-16 00:57:07,603] INFO Connecting to zookeeper on localhost:2181 (kafka.server.KafkaServer)
+[2025-04-16 00:57:07,609] INFO [ZooKeeperClient Kafka server] Initializing a new session to localhost:2181. (kafka.zookeeper.ZooKeeperClient)
+[2025-04-16 00:57:07,612] INFO Client environment:zookeeper.version=3.6.3--6401e4ad2087061bc6b9f80dec2d69f2e3c8660a, built on 04/08/2021 16:35 GMT (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,612] INFO Client environment:host.name=localhost (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,612] INFO Client environment:java.version=11.0.26 (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,612] INFO Client environment:java.vendor=Homebrew (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,612] INFO Client environment:java.home=/opt/homebrew/Cellar/openjdk@11/11.0.26/libexec/openjdk.jdk/Contents/Home (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,612] INFO Client environment:java.class.path=/Users/ihorfranchuk/kafka/bin/../libs/activation-1.1.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/aopalliance-repackaged-2.6.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/argparse4j-0.7.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/audience-annotations-0.5.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/commons-cli-1.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/commons-lang3-3.8.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-api-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-basic-auth-extension-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-json-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-mirror-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-mirror-client-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-runtime-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/connect-transforms-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/hk2-api-2.6.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/hk2-locator-2.6.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/hk2-utils-2.6.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-annotations-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-core-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-databind-2.13.4.2.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-dataformat-csv-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-datatype-jdk8-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-jaxrs-base-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-jaxrs-json-provider-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-module-jaxb-annotations-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jackson-module-scala_2.13-2.13.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jakarta.activation-api-1.2.2.jar:/Users/ihorfranchuk/kafka/bin/../libs/jakarta.annotation-api-1.3.5.jar:/Users/ihorfranchuk/kafka/bin/../libs/jakarta.inject-2.6.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/jakarta.validation-api-2.0.2.jar:/Users/ihorfranchuk/kafka/bin/../libs/jakarta.ws.rs-api-2.1.6.jar:/Users/ihorfranchuk/kafka/bin/../libs/jakarta.xml.bind-api-2.3.3.jar:/Users/ihorfranchuk/kafka/bin/../libs/javassist-3.27.0-GA.jar:/Users/ihorfranchuk/kafka/bin/../libs/javax.annotation-api-1.3.2.jar:/Users/ihorfranchuk/kafka/bin/../libs/javax.servlet-api-3.1.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/javax.ws.rs-api-2.1.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/jaxb-api-2.3.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/jersey-client-2.34.jar:/Users/ihorfranchuk/kafka/bin/../libs/jersey-common-2.34.jar:/Users/ihorfranchuk/kafka/bin/../libs/jersey-container-servlet-2.34.jar:/Users/ihorfranchuk/kafka/bin/../libs/jersey-container-servlet-core-2.34.jar:/Users/ihorfranchuk/kafka/bin/../libs/jersey-hk2-2.34.jar:/Users/ihorfranchuk/kafka/bin/../libs/jersey-server-2.34.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-client-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-continuation-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-http-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-io-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-security-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-server-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-servlet-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-servlets-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-util-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jetty-util-ajax-9.4.48.v20220622.jar:/Users/ihorfranchuk/kafka/bin/../libs/jline-3.21.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/jopt-simple-5.0.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/jose4j-0.7.9.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-clients-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-group-coordinator-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-log4j-appender-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-metadata-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-raft-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-server-common-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-shell-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-storage-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-storage-api-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-streams-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-streams-examples-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-streams-scala_2.13-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-streams-test-utils-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka-tools-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/kafka_2.13-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/lz4-java-1.8.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/maven-artifact-3.8.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/metrics-core-2.2.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/metrics-core-4.1.12.1.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-buffer-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-codec-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-common-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-handler-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-resolver-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-transport-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-transport-classes-epoll-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-transport-native-epoll-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/netty-transport-native-unix-common-4.1.78.Final.jar:/Users/ihorfranchuk/kafka/bin/../libs/osgi-resource-locator-1.0.3.jar:/Users/ihorfranchuk/kafka/bin/../libs/paranamer-2.8.jar:/Users/ihorfranchuk/kafka/bin/../libs/plexus-utils-3.3.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/reflections-0.9.12.jar:/Users/ihorfranchuk/kafka/bin/../libs/reload4j-1.2.19.jar:/Users/ihorfranchuk/kafka/bin/../libs/rocksdbjni-7.1.2.jar:/Users/ihorfranchuk/kafka/bin/../libs/scala-collection-compat_2.13-2.6.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/scala-java8-compat_2.13-1.0.2.jar:/Users/ihorfranchuk/kafka/bin/../libs/scala-library-2.13.10.jar:/Users/ihorfranchuk/kafka/bin/../libs/scala-logging_2.13-3.9.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/scala-reflect-2.13.10.jar:/Users/ihorfranchuk/kafka/bin/../libs/slf4j-api-1.7.36.jar:/Users/ihorfranchuk/kafka/bin/../libs/slf4j-reload4j-1.7.36.jar:/Users/ihorfranchuk/kafka/bin/../libs/snappy-java-1.1.8.4.jar:/Users/ihorfranchuk/kafka/bin/../libs/swagger-annotations-2.2.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/trogdor-3.4.0.jar:/Users/ihorfranchuk/kafka/bin/../libs/zookeeper-3.6.3.jar:/Users/ihorfranchuk/kafka/bin/../libs/zookeeper-jute-3.6.3.jar:/Users/ihorfranchuk/kafka/bin/../libs/zstd-jni-1.5.2-1.jar (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:java.library.path=/Users/ihorfranchuk/Library/Java/Extensions:/Library/Java/Extensions:/Network/Library/Java/Extensions:/System/Library/Java/Extensions:/usr/lib/java:. (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:java.io.tmpdir=/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/ (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:java.compiler=<NA> (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:os.name=Mac OS X (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:os.arch=aarch64 (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:os.version=15.3.2 (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:user.name=ihorfranchuk (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:user.home=/Users/ihorfranchuk (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:user.dir=/Users/ihorfranchuk/kafka (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:os.memory.free=1011MB (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:os.memory.max=1024MB (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,615] INFO Client environment:os.memory.total=1024MB (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,616] INFO Initiating client connection, connectString=localhost:2181 sessionTimeout=18000 watcher=kafka.zookeeper.ZooKeeperClient$ZooKeeperClientWatcher$@363042d7 (org.apache.zookeeper.ZooKeeper)
+[2025-04-16 00:57:07,619] INFO jute.maxbuffer value is 4194304 Bytes (org.apache.zookeeper.ClientCnxnSocket)
+[2025-04-16 00:57:07,620] INFO zookeeper.request.timeout value is 0. feature enabled=false (org.apache.zookeeper.ClientCnxn)
+[2025-04-16 00:57:07,621] INFO [ZooKeeperClient Kafka server] Waiting until connected. (kafka.zookeeper.ZooKeeperClient)
+[2025-04-16 00:57:07,621] INFO Opening socket connection to server localhost/0:0:0:0:0:0:0:1:2181. (org.apache.zookeeper.ClientCnxn)
+[2025-04-16 00:57:07,627] INFO Socket connection established, initiating session, client: /0:0:0:0:0:0:0:1:53993, server: localhost/0:0:0:0:0:0:0:1:2181 (org.apache.zookeeper.ClientCnxn)
+[2025-04-16 00:57:07,641] INFO Session establishment complete on server localhost/0:0:0:0:0:0:0:1:2181, session id = 0x1000031c8d60001, negotiated timeout = 18000 (org.apache.zookeeper.ClientCnxn)
+[2025-04-16 00:57:07,642] INFO [ZooKeeperClient Kafka server] Connected. (kafka.zookeeper.ZooKeeperClient)
+[2025-04-16 00:57:07,780] INFO Cluster ID = DOBNr1-XShKtbMzz3rAQ7Q (kafka.server.KafkaServer)
+[2025-04-16 00:57:07,798] INFO KafkaConfig values: 
+        advertised.listeners = null
+        alter.config.policy.class.name = null
+        alter.log.dirs.replication.quota.window.num = 11
+        alter.log.dirs.replication.quota.window.size.seconds = 1
+        authorizer.class.name = 
+        auto.create.topics.enable = true
+        auto.include.jmx.reporter = true
+        auto.leader.rebalance.enable = true
+        background.threads = 10
+        broker.heartbeat.interval.ms = 2000
+        broker.id = 0
+        broker.id.generation.enable = true
+        broker.rack = null
+        broker.session.timeout.ms = 9000
+        client.quota.callback.class = null
+        compression.type = producer
+        connection.failed.authentication.delay.ms = 100
+        connections.max.idle.ms = 600000
+        connections.max.reauth.ms = 0
+        control.plane.listener.name = null
+        controlled.shutdown.enable = true
+        controlled.shutdown.max.retries = 3
+        controlled.shutdown.retry.backoff.ms = 5000
+        controller.listener.names = null
+        controller.quorum.append.linger.ms = 25
+        controller.quorum.election.backoff.max.ms = 1000
+        controller.quorum.election.timeout.ms = 1000
+        controller.quorum.fetch.timeout.ms = 2000
+        controller.quorum.request.timeout.ms = 2000
+        controller.quorum.retry.backoff.ms = 20
+        controller.quorum.voters = []
+        controller.quota.window.num = 11
+        controller.quota.window.size.seconds = 1
+        controller.socket.timeout.ms = 30000
+        create.topic.policy.class.name = null
+        default.replication.factor = 1
+        delegation.token.expiry.check.interval.ms = 3600000
+        delegation.token.expiry.time.ms = 86400000
+        delegation.token.master.key = null
+        delegation.token.max.lifetime.ms = 604800000
+        delegation.token.secret.key = null
+        delete.records.purgatory.purge.interval.requests = 1
+        delete.topic.enable = true
+        early.start.listeners = null
+        fetch.max.bytes = 57671680
+        fetch.purgatory.purge.interval.requests = 1000
+        group.initial.rebalance.delay.ms = 0
+        group.max.session.timeout.ms = 1800000
+        group.max.size = 2147483647
+        group.min.session.timeout.ms = 6000
+        initial.broker.registration.timeout.ms = 60000
+        inter.broker.listener.name = null
+        inter.broker.protocol.version = 3.4-IV0
+        kafka.metrics.polling.interval.secs = 10
+        kafka.metrics.reporters = []
+        leader.imbalance.check.interval.seconds = 300
+        leader.imbalance.per.broker.percentage = 10
+        listener.security.protocol.map = PLAINTEXT:PLAINTEXT,SSL:SSL,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
+        listeners = PLAINTEXT://:9092
+        log.cleaner.backoff.ms = 15000
+        log.cleaner.dedupe.buffer.size = 134217728
+        log.cleaner.delete.retention.ms = 86400000
+        log.cleaner.enable = true
+        log.cleaner.io.buffer.load.factor = 0.9
+        log.cleaner.io.buffer.size = 524288
+        log.cleaner.io.max.bytes.per.second = 1.7976931348623157E308
+        log.cleaner.max.compaction.lag.ms = 9223372036854775807
+        log.cleaner.min.cleanable.ratio = 0.5
+        log.cleaner.min.compaction.lag.ms = 0
+        log.cleaner.threads = 1
+        log.cleanup.policy = [delete]
+        log.dir = /tmp/kafka-logs
+        log.dirs = /tmp/kafka-logs
+        log.flush.interval.messages = 9223372036854775807
+        log.flush.interval.ms = null
+        log.flush.offset.checkpoint.interval.ms = 60000
+        log.flush.scheduler.interval.ms = 9223372036854775807
+        log.flush.start.offset.checkpoint.interval.ms = 60000
+        log.index.interval.bytes = 4096
+        log.index.size.max.bytes = 10485760
+        log.message.downconversion.enable = true
+        log.message.format.version = 3.0-IV1
+        log.message.timestamp.difference.max.ms = 9223372036854775807
+        log.message.timestamp.type = CreateTime
+        log.preallocate = false
+        log.retention.bytes = -1
+        log.retention.check.interval.ms = 300000
+        log.retention.hours = 168
+        log.retention.minutes = null
+        log.retention.ms = null
+        log.roll.hours = 168
+        log.roll.jitter.hours = 0
+        log.roll.jitter.ms = null
+        log.roll.ms = null
+        log.segment.bytes = 1073741824
+        log.segment.delete.delay.ms = 60000
+        max.connection.creation.rate = 2147483647
+        max.connections = 2147483647
+        max.connections.per.ip = 2147483647
+        max.connections.per.ip.overrides = 
+        max.incremental.fetch.session.cache.slots = 1000
+        message.max.bytes = 1048588
+        metadata.log.dir = null
+        metadata.log.max.record.bytes.between.snapshots = 20971520
+        metadata.log.max.snapshot.interval.ms = 3600000
+        metadata.log.segment.bytes = 1073741824
+        metadata.log.segment.min.bytes = 8388608
+        metadata.log.segment.ms = 604800000
+        metadata.max.idle.interval.ms = 500
+        metadata.max.retention.bytes = 104857600
+        metadata.max.retention.ms = 604800000
+        metric.reporters = []
+        metrics.num.samples = 2
+        metrics.recording.level = INFO
+        metrics.sample.window.ms = 30000
+        min.insync.replicas = 1
+        node.id = 0
+        num.io.threads = 8
+        num.network.threads = 3
+        num.partitions = 1
+        num.recovery.threads.per.data.dir = 1
+        num.replica.alter.log.dirs.threads = null
+        num.replica.fetchers = 1
+        offset.metadata.max.bytes = 4096
+        offsets.commit.required.acks = -1
+        offsets.commit.timeout.ms = 5000
+        offsets.load.buffer.size = 5242880
+        offsets.retention.check.interval.ms = 600000
+        offsets.retention.minutes = 10080
+        offsets.topic.compression.codec = 0
+        offsets.topic.num.partitions = 50
+        offsets.topic.replication.factor = 1
+        offsets.topic.segment.bytes = 104857600
+        password.encoder.cipher.algorithm = AES/CBC/PKCS5Padding
+        password.encoder.iterations = 4096
+        password.encoder.key.length = 128
+        password.encoder.keyfactory.algorithm = null
+        password.encoder.old.secret = null
+        password.encoder.secret = null
+        principal.builder.class = class org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
+        process.roles = []
+        producer.id.expiration.check.interval.ms = 600000
+        producer.id.expiration.ms = 86400000
+        producer.purgatory.purge.interval.requests = 1000
+        queued.max.request.bytes = -1
+        queued.max.requests = 500
+        quota.window.num = 11
+        quota.window.size.seconds = 1
+        remote.log.index.file.cache.total.size.bytes = 1073741824
+        remote.log.manager.task.interval.ms = 30000
+        remote.log.manager.task.retry.backoff.max.ms = 30000
+        remote.log.manager.task.retry.backoff.ms = 500
+        remote.log.manager.task.retry.jitter = 0.2
+        remote.log.manager.thread.pool.size = 10
+        remote.log.metadata.manager.class.name = null
+        remote.log.metadata.manager.class.path = null
+        remote.log.metadata.manager.impl.prefix = null
+        remote.log.metadata.manager.listener.name = null
+        remote.log.reader.max.pending.tasks = 100
+        remote.log.reader.threads = 10
+        remote.log.storage.manager.class.name = null
+        remote.log.storage.manager.class.path = null
+        remote.log.storage.manager.impl.prefix = null
+        remote.log.storage.system.enable = false
+        replica.fetch.backoff.ms = 1000
+        replica.fetch.max.bytes = 1048576
+        replica.fetch.min.bytes = 1
+        replica.fetch.response.max.bytes = 10485760
+        replica.fetch.wait.max.ms = 500
+        replica.high.watermark.checkpoint.interval.ms = 5000
+        replica.lag.time.max.ms = 30000
+        replica.selector.class = null
+        replica.socket.receive.buffer.bytes = 65536
+        replica.socket.timeout.ms = 30000
+        replication.quota.window.num = 11
+        replication.quota.window.size.seconds = 1
+        request.timeout.ms = 30000
+        reserved.broker.max.id = 1000
+        sasl.client.callback.handler.class = null
+        sasl.enabled.mechanisms = [GSSAPI]
+        sasl.jaas.config = null
+        sasl.kerberos.kinit.cmd = /usr/bin/kinit
+        sasl.kerberos.min.time.before.relogin = 60000
+        sasl.kerberos.principal.to.local.rules = [DEFAULT]
+        sasl.kerberos.service.name = null
+        sasl.kerberos.ticket.renew.jitter = 0.05
+        sasl.kerberos.ticket.renew.window.factor = 0.8
+        sasl.login.callback.handler.class = null
+        sasl.login.class = null
+        sasl.login.connect.timeout.ms = null
+        sasl.login.read.timeout.ms = null
+        sasl.login.refresh.buffer.seconds = 300
+        sasl.login.refresh.min.period.seconds = 60
+        sasl.login.refresh.window.factor = 0.8
+        sasl.login.refresh.window.jitter = 0.05
+        sasl.login.retry.backoff.max.ms = 10000
+        sasl.login.retry.backoff.ms = 100
+        sasl.mechanism.controller.protocol = GSSAPI
+        sasl.mechanism.inter.broker.protocol = GSSAPI
+        sasl.oauthbearer.clock.skew.seconds = 30
+        sasl.oauthbearer.expected.audience = null
+        sasl.oauthbearer.expected.issuer = null
+        sasl.oauthbearer.jwks.endpoint.refresh.ms = 3600000
+        sasl.oauthbearer.jwks.endpoint.retry.backoff.max.ms = 10000
+        sasl.oauthbearer.jwks.endpoint.retry.backoff.ms = 100
+        sasl.oauthbearer.jwks.endpoint.url = null
+        sasl.oauthbearer.scope.claim.name = scope
+        sasl.oauthbearer.sub.claim.name = sub
+        sasl.oauthbearer.token.endpoint.url = null
+        sasl.server.callback.handler.class = null
+        sasl.server.max.receive.size = 524288
+        security.inter.broker.protocol = PLAINTEXT
+        security.providers = null
+        socket.connection.setup.timeout.max.ms = 30000
+        socket.connection.setup.timeout.ms = 10000
+        socket.listen.backlog.size = 50
+        socket.receive.buffer.bytes = 102400
+        socket.request.max.bytes = 104857600
+        socket.send.buffer.bytes = 102400
+        ssl.cipher.suites = []
+        ssl.client.auth = none
+        ssl.enabled.protocols = [TLSv1.2, TLSv1.3]
+        ssl.endpoint.identification.algorithm = https
+        ssl.engine.factory.class = null
+        ssl.key.password = null
+        ssl.keymanager.algorithm = SunX509
+        ssl.keystore.certificate.chain = null
+        ssl.keystore.key = null
+        ssl.keystore.location = null
+        ssl.keystore.password = null
+        ssl.keystore.type = JKS
+        ssl.principal.mapping.rules = DEFAULT
+        ssl.protocol = TLSv1.3
+        ssl.provider = null
+        ssl.secure.random.implementation = null
+        ssl.trustmanager.algorithm = PKIX
+        ssl.truststore.certificates = null
+        ssl.truststore.location = null
+        ssl.truststore.password = null
+        ssl.truststore.type = JKS
+        transaction.abort.timed.out.transaction.cleanup.interval.ms = 10000
+        transaction.max.timeout.ms = 900000
+        transaction.remove.expired.transaction.cleanup.interval.ms = 3600000
+        transaction.state.log.load.buffer.size = 5242880
+        transaction.state.log.min.isr = 1
+        transaction.state.log.num.partitions = 50
+        transaction.state.log.replication.factor = 1
+        transaction.state.log.segment.bytes = 104857600
+        transactional.id.expiration.ms = 604800000
+        unclean.leader.election.enable = false
+        zookeeper.clientCnxnSocket = null
+        zookeeper.connect = localhost:2181
+        zookeeper.connection.timeout.ms = 18000
+        zookeeper.max.in.flight.requests = 10
+        zookeeper.metadata.migration.enable = false
+        zookeeper.session.timeout.ms = 18000
+        zookeeper.set.acl = false
+        zookeeper.ssl.cipher.suites = null
+        zookeeper.ssl.client.enable = false
+        zookeeper.ssl.crl.enable = false
+        zookeeper.ssl.enabled.protocols = null
+        zookeeper.ssl.endpoint.identification.algorithm = HTTPS
+        zookeeper.ssl.keystore.location = null
+        zookeeper.ssl.keystore.password = null
+        zookeeper.ssl.keystore.type = null
+        zookeeper.ssl.ocsp.enable = false
+        zookeeper.ssl.protocol = TLSv1.2
+        zookeeper.ssl.truststore.location = null
+        zookeeper.ssl.truststore.password = null
+        zookeeper.ssl.truststore.type = null
+ (kafka.server.KafkaConfig)
+[2025-04-16 00:57:07,819] INFO [ThrottledChannelReaper-Fetch]: Starting (kafka.server.ClientQuotaManager$ThrottledChannelReaper)
+[2025-04-16 00:57:07,819] INFO [ThrottledChannelReaper-Produce]: Starting (kafka.server.ClientQuotaManager$ThrottledChannelReaper)
+[2025-04-16 00:57:07,819] INFO [ThrottledChannelReaper-Request]: Starting (kafka.server.ClientQuotaManager$ThrottledChannelReaper)
+[2025-04-16 00:57:07,820] INFO [ThrottledChannelReaper-ControllerMutation]: Starting (kafka.server.ClientQuotaManager$ThrottledChannelReaper)
+[2025-04-16 00:57:07,834] INFO Loading logs from log dirs ArraySeq(/tmp/kafka-logs) (kafka.log.LogManager)
+[2025-04-16 00:57:07,836] INFO Skipping recovery for all logs in /tmp/kafka-logs since clean shutdown file was found (kafka.log.LogManager)
+[2025-04-16 00:57:07,841] INFO Loaded 0 logs in 6ms. (kafka.log.LogManager)
+[2025-04-16 00:57:07,841] INFO Starting log cleanup with a period of 300000 ms. (kafka.log.LogManager)
+[2025-04-16 00:57:07,842] INFO Starting log flusher with a default period of 9223372036854775807 ms. (kafka.log.LogManager)
+[2025-04-16 00:57:07,865] INFO [feature-zk-node-event-process-thread]: Starting (kafka.server.FinalizedFeatureChangeListener$ChangeNotificationProcessorThread)
+[2025-04-16 00:57:07,873] INFO [MetadataCache brokerId=0] Updated cache from existing <empty> to latest FinalizedFeaturesAndEpoch(features=Map(), epoch=0). (kafka.server.metadata.ZkMetadataCache)
+[2025-04-16 00:57:07,887] INFO [BrokerToControllerChannelManager broker=0 name=forwarding]: Starting (kafka.server.BrokerToControllerRequestThread)
+[2025-04-16 00:57:08,004] INFO Updated connection-accept-rate max connection creation rate to 2147483647 (kafka.network.ConnectionQuotas)
+[2025-04-16 00:57:08,008] INFO Awaiting socket connections on 0.0.0.0:9092. (kafka.network.DataPlaneAcceptor)
+[2025-04-16 00:57:08,018] INFO [SocketServer listenerType=ZK_BROKER, nodeId=0] Created data-plane acceptor and processors for endpoint : ListenerName(PLAINTEXT) (kafka.network.SocketServer)
+[2025-04-16 00:57:08,020] INFO [BrokerToControllerChannelManager broker=0 name=alterPartition]: Starting (kafka.server.BrokerToControllerRequestThread)
+[2025-04-16 00:57:08,027] INFO [ExpirationReaper-0-Produce]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,028] INFO [ExpirationReaper-0-Fetch]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,028] INFO [ExpirationReaper-0-DeleteRecords]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,028] INFO [ExpirationReaper-0-ElectLeader]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,033] INFO [LogDirFailureHandler]: Starting (kafka.server.ReplicaManager$LogDirFailureHandler)
+[2025-04-16 00:57:08,050] INFO Creating /brokers/ids/0 (is it secure? false) (kafka.zk.KafkaZkClient)
+[2025-04-16 00:57:08,061] INFO Stat of the created znode at /brokers/ids/0 is: 46,46,1744757828054,1744757828054,1,0,0,72057807860793345,202,0,46
+ (kafka.zk.KafkaZkClient)
+[2025-04-16 00:57:08,061] INFO Registered broker 0 at path /brokers/ids/0 with addresses: PLAINTEXT://localhost:9092, czxid (broker epoch): 46 (kafka.zk.KafkaZkClient)
+[2025-04-16 00:57:08,094] INFO [ExpirationReaper-0-topic]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,096] INFO [ExpirationReaper-0-Heartbeat]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,097] INFO [ExpirationReaper-0-Rebalance]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,104] INFO [GroupCoordinator 0]: Starting up. (kafka.coordinator.group.GroupCoordinator)
+[2025-04-16 00:57:08,105] INFO [GroupCoordinator 0]: Startup complete. (kafka.coordinator.group.GroupCoordinator)
+[2025-04-16 00:57:08,112] INFO [TransactionCoordinator id=0] Starting up. (kafka.coordinator.transaction.TransactionCoordinator)
+[2025-04-16 00:57:08,113] INFO [Transaction Marker Channel Manager 0]: Starting (kafka.coordinator.transaction.TransactionMarkerChannelManager)
+[2025-04-16 00:57:08,113] INFO [TransactionCoordinator id=0] Startup complete. (kafka.coordinator.transaction.TransactionCoordinator)
+[2025-04-16 00:57:08,128] INFO [ExpirationReaper-0-AlterAcls]: Starting (kafka.server.DelayedOperationPurgatory$ExpiredOperationReaper)
+[2025-04-16 00:57:08,136] INFO [/config/changes-event-process-thread]: Starting (kafka.common.ZkNodeChangeNotificationListener$ChangeEventProcessThread)
+[2025-04-16 00:57:08,142] INFO [SocketServer listenerType=ZK_BROKER, nodeId=0] Enabling request processing. (kafka.network.SocketServer)
+[2025-04-16 00:57:08,145] INFO Kafka version: 3.4.0 (org.apache.kafka.common.utils.AppInfoParser)
+[2025-04-16 00:57:08,145] INFO Kafka commitId: 2e1947d240607d53 (org.apache.kafka.common.utils.AppInfoParser)
+[2025-04-16 00:57:08,145] INFO Kafka startTimeMs: 1744757828143 (org.apache.kafka.common.utils.AppInfoParser)
+[2025-04-16 00:57:08,146] INFO [KafkaServer id=0] started (kafka.server.KafkaServer)
+[2025-04-16 00:57:08,193] INFO [BrokerToControllerChannelManager broker=0 name=forwarding]: Recorded new controller, from now on will use node localhost:9092 (id: 0 rack: null) (kafka.server.BrokerToControllerRequestThread)
+[2025-04-16 00:57:08,223] INFO [BrokerToControllerChannelManager broker=0 name=alterPartition]: Recorded new controller, from now on will use node localhost:9092 (id: 0 rack: null) (kafka.server.BrokerToControllerRequestThread)
+Запуск PySpark джоб для batch data lake...
+25/04/16 00:57:18 WARN Utils: Your hostname, Ihors-MacBook-Pro.local resolves to a loopback address: 127.0.0.1; using 192.168.0.224 instead (on interface en0)
+25/04/16 00:57:18 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+:: loading settings :: url = jar:file:/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/pyspark/jars/ivy-2.5.1.jar!/org/apache/ivy/core/settings/ivysettings.xml
+Ivy Default Cache set to: /Users/ihorfranchuk/.ivy2/cache
+The jars for the packages stored in: /Users/ihorfranchuk/.ivy2/jars
+org.apache.spark#spark-sql-kafka-0-10_2.12 added as a dependency
+:: resolving dependencies :: org.apache.spark#spark-submit-parent-59cf6d90-9e61-4264-a5fa-24d9ccfbe7fe;1.0
+        confs: [default]
+        found org.apache.spark#spark-sql-kafka-0-10_2.12;3.3.0 in central
+        found org.apache.spark#spark-token-provider-kafka-0-10_2.12;3.3.0 in central
+        found org.apache.kafka#kafka-clients;2.8.1 in central
+        found org.lz4#lz4-java;1.8.0 in central
+        found org.xerial.snappy#snappy-java;1.1.8.4 in central
+        found org.slf4j#slf4j-api;1.7.32 in central
+        found org.apache.hadoop#hadoop-client-runtime;3.3.2 in central
+        found org.spark-project.spark#unused;1.0.0 in central
+        found org.apache.hadoop#hadoop-client-api;3.3.2 in central
+        found commons-logging#commons-logging;1.1.3 in central
+        found com.google.code.findbugs#jsr305;3.0.0 in central
+        found org.apache.commons#commons-pool2;2.11.1 in central
+:: resolution report :: resolve 175ms :: artifacts dl 5ms
+        :: modules in use:
+        com.google.code.findbugs#jsr305;3.0.0 from central in [default]
+        commons-logging#commons-logging;1.1.3 from central in [default]
+        org.apache.commons#commons-pool2;2.11.1 from central in [default]
+        org.apache.hadoop#hadoop-client-api;3.3.2 from central in [default]
+        org.apache.hadoop#hadoop-client-runtime;3.3.2 from central in [default]
+        org.apache.kafka#kafka-clients;2.8.1 from central in [default]
+        org.apache.spark#spark-sql-kafka-0-10_2.12;3.3.0 from central in [default]
+        org.apache.spark#spark-token-provider-kafka-0-10_2.12;3.3.0 from central in [default]
+        org.lz4#lz4-java;1.8.0 from central in [default]
+        org.slf4j#slf4j-api;1.7.32 from central in [default]
+        org.spark-project.spark#unused;1.0.0 from central in [default]
+        org.xerial.snappy#snappy-java;1.1.8.4 from central in [default]
+        ---------------------------------------------------------------------
+        |                  |            modules            ||   artifacts   |
+        |       conf       | number| search|dwnlded|evicted|| number|dwnlded|
+        ---------------------------------------------------------------------
+        |      default     |   12  |   0   |   0   |   0   ||   12  |   0   |
+        ---------------------------------------------------------------------
+:: retrieving :: org.apache.spark#spark-submit-parent-59cf6d90-9e61-4264-a5fa-24d9ccfbe7fe
+        confs: [default]
+        0 artifacts copied, 12 already retrieved (0kB/4ms)
+25/04/16 00:57:18 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+25/04/16 00:57:19 INFO SparkContext: Running Spark version 3.5.5
+25/04/16 00:57:19 INFO SparkContext: OS info Mac OS X, 15.3.2, aarch64
+25/04/16 00:57:19 INFO SparkContext: Java version 11.0.26
+25/04/16 00:57:19 INFO ResourceUtils: ==============================================================
+25/04/16 00:57:19 INFO ResourceUtils: No custom resources configured for spark.driver.
+25/04/16 00:57:19 INFO ResourceUtils: ==============================================================
+25/04/16 00:57:19 INFO SparkContext: Submitted application: StreamingPipeline
+25/04/16 00:57:19 INFO ResourceProfile: Default ResourceProfile created, executor resources: Map(cores -> name: cores, amount: 1, script: , vendor: , memory -> name: memory, amount: 1024, script: , vendor: , offHeap -> name: offHeap, amount: 0, script: , vendor: ), task resources: Map(cpus -> name: cpus, amount: 1.0)
+25/04/16 00:57:19 INFO ResourceProfile: Limiting resource is cpu
+25/04/16 00:57:19 INFO ResourceProfileManager: Added ResourceProfile id: 0
+25/04/16 00:57:19 INFO SecurityManager: Changing view acls to: ihorfranchuk
+25/04/16 00:57:19 INFO SecurityManager: Changing modify acls to: ihorfranchuk
+25/04/16 00:57:19 INFO SecurityManager: Changing view acls groups to: 
+25/04/16 00:57:19 INFO SecurityManager: Changing modify acls groups to: 
+25/04/16 00:57:19 INFO SecurityManager: SecurityManager: authentication disabled; ui acls disabled; users with view permissions: ihorfranchuk; groups with view permissions: EMPTY; users with modify permissions: ihorfranchuk; groups with modify permissions: EMPTY
+25/04/16 00:57:19 INFO Utils: Successfully started service 'sparkDriver' on port 53997.
+25/04/16 00:57:19 INFO SparkEnv: Registering MapOutputTracker
+25/04/16 00:57:19 INFO SparkEnv: Registering BlockManagerMaster
+25/04/16 00:57:19 INFO BlockManagerMasterEndpoint: Using org.apache.spark.storage.DefaultTopologyMapper for getting topology information
+25/04/16 00:57:19 INFO BlockManagerMasterEndpoint: BlockManagerMasterEndpoint up
+25/04/16 00:57:19 INFO SparkEnv: Registering BlockManagerMasterHeartbeat
+25/04/16 00:57:19 INFO DiskBlockManager: Created local directory at /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/blockmgr-dcff2958-2008-40be-ba1b-2158fdcbed8e
+25/04/16 00:57:19 INFO MemoryStore: MemoryStore started with capacity 434.4 MiB
+25/04/16 00:57:19 INFO SparkEnv: Registering OutputCommitCoordinator
+25/04/16 00:57:19 INFO JettyUtils: Start Jetty 0.0.0.0:4040 for SparkUI
+25/04/16 00:57:19 INFO Utils: Successfully started service 'SparkUI' on port 4040.
+25/04/16 00:57:19 INFO SparkContext: Added JAR jars/mysql-connector-j-8.0.32.jar at spark://192.168.0.224:53997/jars/mysql-connector-j-8.0.32.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.apache.kafka_kafka-clients-2.8.1.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.apache.kafka_kafka-clients-2.8.1.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.apache.kafka_kafka-clients-2.8.1.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.kafka_kafka-clients-2.8.1.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/com.google.code.findbugs_jsr305-3.0.0.jar at file:///Users/ihorfranchuk/.ivy2/jars/com.google.code.findbugs_jsr305-3.0.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/com.google.code.findbugs_jsr305-3.0.0.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/com.google.code.findbugs_jsr305-3.0.0.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.apache.commons_commons-pool2-2.11.1.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.apache.commons_commons-pool2-2.11.1.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.apache.commons_commons-pool2-2.11.1.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.commons_commons-pool2-2.11.1.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.spark-project.spark_unused-1.0.0.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.spark-project.spark_unused-1.0.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.spark-project.spark_unused-1.0.0.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.spark-project.spark_unused-1.0.0.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.lz4_lz4-java-1.8.0.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.lz4_lz4-java-1.8.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.lz4_lz4-java-1.8.0.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.lz4_lz4-java-1.8.0.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.xerial.snappy_snappy-java-1.1.8.4.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.xerial.snappy_snappy-java-1.1.8.4.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.xerial.snappy_snappy-java-1.1.8.4.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.xerial.snappy_snappy-java-1.1.8.4.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.slf4j_slf4j-api-1.7.32.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.slf4j_slf4j-api-1.7.32.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.slf4j_slf4j-api-1.7.32.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.slf4j_slf4j-api-1.7.32.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-api-3.3.2.jar at file:///Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-api-3.3.2.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-api-3.3.2.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.hadoop_hadoop-client-api-3.3.2.jar
+25/04/16 00:57:19 INFO SparkContext: Added file file:///Users/ihorfranchuk/.ivy2/jars/commons-logging_commons-logging-1.1.3.jar at file:///Users/ihorfranchuk/.ivy2/jars/commons-logging_commons-logging-1.1.3.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: Copying /Users/ihorfranchuk/.ivy2/jars/commons-logging_commons-logging-1.1.3.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/commons-logging_commons-logging-1.1.3.jar
+25/04/16 00:57:19 INFO Executor: Starting executor ID driver on host 192.168.0.224
+25/04/16 00:57:19 INFO Executor: OS info Mac OS X, 15.3.2, aarch64
+25/04/16 00:57:19 INFO Executor: Java version 11.0.26
+25/04/16 00:57:19 INFO Executor: Starting executor with user classpath (userClassPathFirst = false): ''
+25/04/16 00:57:19 INFO Executor: Created or updated repl class loader org.apache.spark.util.MutableURLClassLoader@66fe1c45 for default.
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.apache.kafka_kafka-clients-2.8.1.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.apache.kafka_kafka-clients-2.8.1.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.kafka_kafka-clients-2.8.1.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.apache.commons_commons-pool2-2.11.1.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.apache.commons_commons-pool2-2.11.1.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.commons_commons-pool2-2.11.1.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.spark-project.spark_unused-1.0.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.spark-project.spark_unused-1.0.0.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.spark-project.spark_unused-1.0.0.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.spark_spark-sql-kafka-0-10_2.12-3.3.0.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/commons-logging_commons-logging-1.1.3.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/commons-logging_commons-logging-1.1.3.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/commons-logging_commons-logging-1.1.3.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.slf4j_slf4j-api-1.7.32.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.slf4j_slf4j-api-1.7.32.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.slf4j_slf4j-api-1.7.32.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.spark_spark-token-provider-kafka-0-10_2.12-3.3.0.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.lz4_lz4-java-1.8.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.lz4_lz4-java-1.8.0.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.lz4_lz4-java-1.8.0.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.hadoop_hadoop-client-runtime-3.3.2.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/com.google.code.findbugs_jsr305-3.0.0.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/com.google.code.findbugs_jsr305-3.0.0.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/com.google.code.findbugs_jsr305-3.0.0.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-api-3.3.2.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.apache.hadoop_hadoop-client-api-3.3.2.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.apache.hadoop_hadoop-client-api-3.3.2.jar
+25/04/16 00:57:19 INFO Executor: Fetching file:///Users/ihorfranchuk/.ivy2/jars/org.xerial.snappy_snappy-java-1.1.8.4.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO Utils: /Users/ihorfranchuk/.ivy2/jars/org.xerial.snappy_snappy-java-1.1.8.4.jar has been previously copied to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/org.xerial.snappy_snappy-java-1.1.8.4.jar
+25/04/16 00:57:19 INFO Executor: Fetching spark://192.168.0.224:53997/jars/mysql-connector-j-8.0.32.jar with timestamp 1744757839464
+25/04/16 00:57:19 INFO TransportClientFactory: Successfully created connection to /192.168.0.224:53997 after 10 ms (0 ms spent in bootstraps)
+25/04/16 00:57:19 INFO Utils: Fetching spark://192.168.0.224:53997/jars/mysql-connector-j-8.0.32.jar to /private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/fetchFileTemp15342353437331240249.tmp
+25/04/16 00:57:19 INFO Executor: Adding file:/private/var/folders/rr/yjhyl7vj1v31y64cmr2n2t4c0000gn/T/spark-d2891d8d-17f9-45fc-9bb8-d1af35bb8e2e/userFiles-5e8ea8a1-45b2-419e-9ece-3f936fe06e59/mysql-connector-j-8.0.32.jar to class loader default
+25/04/16 00:57:19 INFO Utils: Successfully started service 'org.apache.spark.network.netty.NettyBlockTransferService' on port 53999.
+25/04/16 00:57:19 INFO NettyBlockTransferService: Server created on 192.168.0.224:53999
+25/04/16 00:57:19 INFO BlockManager: Using org.apache.spark.storage.RandomBlockReplicationPolicy for block replication policy
+25/04/16 00:57:19 INFO BlockManagerMaster: Registering BlockManager BlockManagerId(driver, 192.168.0.224, 53999, None)
+25/04/16 00:57:19 INFO BlockManagerMasterEndpoint: Registering block manager 192.168.0.224:53999 with 434.4 MiB RAM, BlockManagerId(driver, 192.168.0.224, 53999, None)
+25/04/16 00:57:19 INFO BlockManagerMaster: Registered BlockManager BlockManagerId(driver, 192.168.0.224, 53999, None)
+25/04/16 00:57:19 INFO BlockManager: Initialized BlockManager: BlockManagerId(driver, 192.168.0.224, 53999, None)
+Traceback (most recent call last):
+  File "/Users/ihorfranchuk/PycharmProjects/PythonProject15/streaming_pipeline.py", line 46, in <module>
+    df_bio = spark.read.format("jdbc").options(
+  File "/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/pyspark/python/lib/pyspark.zip/pyspark/sql/readwriter.py", line 314, in load
+  File "/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/pyspark/python/lib/py4j-0.10.9.7-src.zip/py4j/java_gateway.py", line 1322, in __call__
+  File "/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/pyspark/python/lib/pyspark.zip/pyspark/errors/exceptions/captured.py", line 179, in deco
+  File "/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/pyspark/python/lib/py4j-0.10.9.7-src.zip/py4j/protocol.py", line 326, in get_return_value
+py4j.protocol.Py4JJavaError: An error occurred while calling o54.load.
+: java.lang.ClassNotFoundException: com.mysql.cj.jdbc.Driver
+        at java.base/java.net.URLClassLoader.findClass(URLClassLoader.java:476)
+        at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:594)
+        at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:527)
+        at org.apache.spark.sql.execution.datasources.jdbc.DriverRegistry$.register(DriverRegistry.scala:46)
+        at org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions.$anonfun$driverClass$1(JDBCOptions.scala:103)
+        at org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions.$anonfun$driverClass$1$adapted(JDBCOptions.scala:103)
+        at scala.Option.foreach(Option.scala:407)
+        at org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions.<init>(JDBCOptions.scala:103)
+        at org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions.<init>(JDBCOptions.scala:41)
+        at org.apache.spark.sql.execution.datasources.jdbc.JdbcRelationProvider.createRelation(JdbcRelationProvider.scala:34)
+        at org.apache.spark.sql.execution.datasources.DataSource.resolveRelation(DataSource.scala:346)
+        at org.apache.spark.sql.DataFrameReader.loadV1Source(DataFrameReader.scala:229)
+        at org.apache.spark.sql.DataFrameReader.$anonfun$load$2(DataFrameReader.scala:211)
+        at scala.Option.getOrElse(Option.scala:189)
+        at org.apache.spark.sql.DataFrameReader.load(DataFrameReader.scala:211)
+        at org.apache.spark.sql.DataFrameReader.load(DataFrameReader.scala:172)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+        at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+        at py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+        at py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)
+        at py4j.Gateway.invoke(Gateway.java:282)
+        at py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+        at py4j.commands.CallCommand.execute(CallCommand.java:79)
+        at py4j.ClientServerConnection.waitForCommands(ClientServerConnection.java:182)
+        at py4j.ClientServerConnection.run(ClientServerConnection.java:106)
+        at java.base/java.lang.Thread.run(Thread.java:829)
+
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % 
+
+0115 160425 
+
+
+
+
+
+mysql
+8410864b8fe9d5d74f5c10215196e767ab148dadf60b9168024111f866c812a0
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % airflow webserver
+
+  ____________       _____________
+ ____    |__( )_________  __/__  /________      __
+____  /| |_  /__  ___/_  /_ __  /_  __ \_ | /| / /
+___  ___ |  / _  /   _  __/ _  / / /_/ /_ |/ |/ /
+ _/_/  |_/_/  /_/    /_/    /_/  \____/____/|__/
+Running the Gunicorn Server with:
+Workers: 4 sync
+Host: 0.0.0.0:8080
+Timeout: 120
+Logfiles: - -
+Access Logformat: 
+=================================================================
+/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/flask_limiter/extension.py:330 UserWarning: Using the in-memory storage for tracking rate limits as no storage was explicitly specified. This is not recommended for production use. See: https://flask-limiter.readthedocs.io#configuring-a-storage-backend for documentation about configuring the storage backend.
+[2025-04-16T01:14:24.725+0200] {workday.py:41} WARNING - Could not import pandas. Holidays will not be considered.
+/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/airflow/api_connexion/schemas/task_schema.py:52 ChangedInMarshmallow4Warning: `Number` field should not be instantiated. Use `Integer`, `Float`, or `Decimal` instead.
+/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/airflow/api_connexion/schemas/task_schema.py:55 ChangedInMarshmallow4Warning: `Number` field should not be instantiated. Use `Integer`, `Float`, or `Decimal` instead.
+/Users/ihorfranchuk/PycharmProjects/PythonProject15/.venv/lib/python3.9/site-packages/airflow/api_connexion/schemas/task_schema.py:59 ChangedInMarshmallow4Warning: `Number` field should not be instantiated. Use `Integer`, `Float`, or `Decimal` instead.
+[2025-04-16 01:14:25 +0200] [24300] [INFO] Starting gunicorn 23.0.0
+[2025-04-16 01:14:25 +0200] [24300] [INFO] Listening at: http://0.0.0.0:8080 (24300)
+[2025-04-16 01:14:25 +0200] [24300] [INFO] Using worker: sync
+[2025-04-16 01:14:25 +0200] [24302] [INFO] Booting worker with pid: 24302
+[2025-04-16 01:14:25 +0200] [24303] [INFO] Booting worker with pid: 24303
+[2025-04-16 01:14:25 +0200] [24304] [INFO] Booting worker with pid: 24304
+[2025-04-16 01:14:25 +0200] [24305] [INFO] Booting worker with pid: 24305
+airflow scheduler
+
+
+
+
+
+0117 160425 
+
+
+
+
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % airflow scheduler
+
+  ____________       _____________
+ ____    |__( )_________  __/__  /________      __
+____  /| |_  /__  ___/_  /_ __  /_  __ \_ | /| / /
+___  ___ |  / _  /   _  __/ _  / / /_/ /_ |/ |/ /
+ _/_/  |_/_/  /_/    /_/    /_/  \____/____/|__/
+[2025-04-16T01:16:19.632+0200] {workday.py:41} WARNING - Could not import pandas. Holidays will not be considered.
+[2025-04-16T01:16:19.634+0200] {executor_loader.py:258} INFO - Loaded executor: SequentialExecutor
+[2025-04-16T01:16:19.685+0200] {scheduler_job_runner.py:950} INFO - Starting the scheduler
+[2025-04-16T01:16:19.685+0200] {scheduler_job_runner.py:957} INFO - Processing each file at most -1 times
+[2025-04-16T01:16:19.688+0200] {manager.py:174} INFO - Launched DagFileProcessorManager with pid: 24745
+[2025-04-16T01:16:19.689+0200] {scheduler_job_runner.py:1949} INFO - Adopting or resetting orphaned tasks for active dag runs
+[2025-04-16 01:16:20 +0200] [24744] [INFO] Starting gunicorn 23.0.0
+[2025-04-16 01:16:20 +0200] [24744] [INFO] Listening at: http://[::]:8793 (24744)
+[2025-04-16 01:16:20 +0200] [24744] [INFO] Using worker: sync
+[2025-04-16T01:16:20.164+0200] {settings.py:63} INFO - Configured default timezone UTC
+[2025-04-16 01:16:20 +0200] [24748] [INFO] Booting worker with pid: 24748
+[2025-04-16T01:16:20.172+0200] {manager.py:406} WARNING - Because we cannot use more than 1 thread (parsing_processes = 2) when using sqlite. So we set parallelism to 1.
+[2025-04-16 01:16:20 +0200] [24749] [INFO] Booting worker with pid: 24749
+[2025-04-16T01:16:39.267+0200] {workday.py:41} WARNING - Could not import pandas. Holidays will not be considered.
+
+
+
+
+
+
+
+
+
+0235 160425 
+
+
+
+
+
+Нижче наведено оновлений інтегрований розв’язок для другої частини проєкту з використанням Prefect (версії 2.x), який автоматизує завдання завантаження CSV-файлів із FTP‑сервера, їх обробку за допомогою PySpark та збереження результатів у Parquet-форматі у шарах bronze, silver, gold. Код включає обробку помилок у випадку, якщо FTP‑сервер недоступний або з’єднання перевищує час очікування, та виводить інформацію про помилки.
+
+> **Примітка щодо FTP-сервера:**  
+> Помилка типу "Failed to establish a new connection" означає, що сервер **ftp.goit.study** не відповідає або відбувається перевищення часу очікування. Переконайтеся, що у вас є інтернет‑з’єднання та що URL правильний. Якщо сервер недоступний, можна додатково налаштувати час очікування чи використати альтернативний спосіб завантаження даних. У цьому прикладі використовується стандартний timeout.
+
+Нижче подано повний код із зазначеними файлами та покроковими інструкціями для запуску.
+
+──────────────────────────────
+### Файл: `prefect_landing_to_bronze.py`
+
+```python
+# prefect_landing_to_bronze.py
+import requests
+from pyspark.sql import SparkSession
+from prefect import flow, task
+import sys
+
+@task
+def download_file(file_name: str) -> str:
+    """
+    Завантажує CSV-файл з FTP-сервера та повертає локальний шлях до файлу.
+    У випадку помилки з’єднання або тайм-ауту видає зрозуміле повідомлення.
+    """
+    base_url = "https://ftp.goit.study/neoversity/"
+    url = base_url + file_name + ".csv"
+    local_file = file_name + ".csv"
+    print(f"Завантаження даних з: {url}")
+    
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            with open(local_file, "wb") as f:
+                f.write(response.content)
+            print(f"Файл {local_file} успішно завантажено.")
+            return local_file
+        else:
+            sys.exit(f"ERROR: HTTP статус {response.status_code} при завантаженні {url}")
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"ERROR: Не вдалося встановити з’єднання з FTP-сервером. Деталі: {e}")
+
+@task
+def convert_to_parquet(file_name: str, output_dir: str) -> None:
+    """
+    Читає CSV-файл за допомогою PySpark і зберігає результат у форматі Parquet.
+    """
+    spark = SparkSession.builder.appName("LandingToBronze").getOrCreate()
+    df = spark.read.option("header", "true").option("inferSchema", "true").csv(file_name)
+    df.write.mode("overwrite").parquet(output_dir)
+    print(f"Дані з {file_name} збережено у {output_dir}")
+    spark.stop()
+
+@flow(name="LandingToBronze Flow")
+def landing_to_bronze_flow():
+    for dataset in ["athlete_bio", "athlete_event_results"]:
+        csv_file = download_file(dataset)
+        output_path = f"bronze/{dataset}.parquet"
+        convert_to_parquet(csv_file, output_path)
+
+if __name__ == "__main__":
+    landing_to_bronze_flow()
+```
+
+──────────────────────────────
+### Файл: `prefect_bronze_to_silver.py`
+
+```python
+# prefect_bronze_to_silver.py
+import re
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col
+from pyspark.sql.types import StringType
+from prefect import flow, task
+
+def clean_text(text: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9,.\\"\']', '', str(text))
+
+clean_text_udf = udf(clean_text, StringType())
+
+@task
+def process_dataset(input_path: str, output_path: str) -> None:
+    spark = SparkSession.builder.appName("BronzeToSilver").getOrCreate()
+    df = spark.read.parquet(input_path)
+    for c in df.columns:
+        df = df.withColumn(c, clean_text_udf(col(c)))
+    df_clean = df.dropDuplicates()
+    df_clean.write.mode("overwrite").parquet(output_path)
+    print(f"Дані з {input_path} очищено та збережено у {output_path}")
+    spark.stop()
+
+@flow(name="BronzeToSilver Flow")
+def bronze_to_silver_flow():
+    mapping = {
+        "athlete_bio": ("bronze/athlete_bio.parquet", "silver/athlete_bio.parquet"),
+        "athlete_event_results": ("bronze/athlete_event_results.parquet", "silver/athlete_event_results.parquet")
+    }
+    for key, (in_path, out_path) in mapping.items():
+        process_dataset(in_path, out_path)
+
+if __name__ == "__main__":
+    bronze_to_silver_flow()
+```
+
+──────────────────────────────
+### Файл: `prefect_silver_to_gold.py`
+
+```python
+# prefect_silver_to_gold.py
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, avg, current_timestamp, round as spark_round
+from prefect import flow, task
+
+@task
+def aggregate_data() -> None:
+    spark = SparkSession.builder.appName("SilverToGold").getOrCreate()
+    df_bio = spark.read.parquet("silver/athlete_bio.parquet")
+    df_events = spark.read.parquet("silver/athlete_event_results.parquet")
+    
+    # Об’єднання за athlete_id
+    df_joined = df_bio.join(df_events, "athlete_id")
+    
+    df_gold = df_joined.groupBy("sport", "medal", "sex", "country_noc") \
+        .agg(
+            spark_round(avg("height"), 2).alias("avg_height"),
+            spark_round(avg("weight"), 2).alias("avg_weight")
+        ) \
+        .withColumn("timestamp", current_timestamp())
+    
+    output_path = "gold/avg_stats.parquet"
+    df_gold.write.mode("overwrite").parquet(output_path)
+    print(f"Агреговані дані збережено у {output_path}")
+    df_gold.show(truncate=False)
+    spark.stop()
+
+@flow(name="SilverToGold Flow")
+def silver_to_gold_flow():
+    aggregate_data()
+
+if __name__ == "__main__":
+    silver_to_gold_flow()
+```
+
+──────────────────────────────
+### Файл: `prefect_pipeline.py` (Основний Prefect Flow)
+
+```python
+# prefect_pipeline.py
+from prefect import flow
+import os
+from prefect_landing_to_bronze import landing_to_bronze_flow
+from prefect_bronze_to_silver import bronze_to_silver_flow
+from prefect_silver_to_gold import silver_to_gold_flow
+
+@flow(name="Batch Data Lake Pipeline")
+def batch_data_lake_pipeline():
+    # Перевірка наявності необхідних директорій та їх створення
+    for d in ["bronze", "silver", "gold"]:
+        if not os.path.exists(d):
+            os.makedirs(d)
+            print(f"Директорія '{d}' створена.")
+        else:
+            print(f"Директорія '{d}' існує.")
+    
+    landing_to_bronze_flow()
+    bronze_to_silver_flow()
+    silver_to_gold_flow()
+
+if __name__ == "__main__":
+    batch_data_lake_pipeline()
+```
+
+──────────────────────────────
+### Інструкції з виконання
+
+1. **Структуруйте проєкт:**  
+   Розмістіть файли:
+   - `prefect_pipeline.py`
+   - `prefect_landing_to_bronze.py`
+   - `prefect_bronze_to_silver.py`
+   - `prefect_silver_to_gold.py`  
+   у кореневому каталозі проєкту (наприклад, `/Users/ihorfranchuk/PycharmProjects/PythonProject15`).
+
+2. **Створіть необхідні директорії:**  
+   Якщо директорії `bronze`, `silver` та `gold` ще не існують, їх створення відбудеться автоматично у функції `batch_data_lake_pipeline()`.
+
+3. **Встановіть залежності:**  
+   Виконайте у Terminal:
+   ```bash
+   pip install prefect pyspark mysql-connector-python requests
+   ```
+
+4. **Запустіть основний Prefect Flow:**  
+   У Terminal або через PyCharm запустіть:
+   ```bash
+   python prefect_pipeline.py
+   ```
+   Flow виконає послідовно завдання:
+   - Завантаження CSV з FTP та збереження у форматі Parquet (bronze-шар);
+   - Очищення даних і видалення дублікатів (silver-шар);
+   - Об’єднання та агрегація даних із додаванням часової мітки (gold-шар);
+   - Всі повідомлення про виконання відображатимуться у консолі.
+
+5. **Перевірте результати:**  
+   - Перегляньте вивід команди (звіт для кожного кроку).
+   - Перевірте файли Parquet у директоріях `bronze`, `silver` і `gold`.
+   - В кінці агрегований DataFrame буде показаний у консолі за допомогою `df_gold.show()`.
+
+---
+
+### Підсумок
+
+Цей інтегрований розв’язок із застосуванням Prefect автоматизує весь ETL-процес для Batch Data Lake: від завантаження CSV з FTP, до очищення даних, їх об’єднання, агрегації та збереження результатів у директорії `gold`. Запустіть файл **prefect_pipeline.py** у своєму середовищі (через PyCharm або Terminal), і процес виконається автоматично, забезпечуючи очікувані результати згідно умов завдання.
+
+
+
+
+
+
+0236 160425 
+
+
+
+02:30:35.411 | INFO    | prefect - Starting temporary server on http://127.0.0.1:8887
+See https://docs.prefect.io/3.0/manage/self-host#self-host-a-prefect-server for more information on running a dedicated Prefect server.
+02:30:36.951 | INFO    | Flow run 'aquatic-jackal' - Beginning flow run 'aquatic-jackal' for flow 'Batch Data Lake Pipeline'
+Директорія 'bronze' існує.
+Директорія 'silver' існує.
+Директорія 'gold' існує.
+02:30:37.007 | INFO    | Flow run 'bouncy-kittiwake' - Beginning subflow run 'bouncy-kittiwake' for flow 'LandingToBronze Flow'
+Завантаження даних з: https://ftp.goit.study/neoversity/athlete_bio.csv
+02:31:07.024 | ERROR   | Task run 'download_file-44c' - Crash detected! Execution was aborted by Python system exit call.
+02:31:07.028 | ERROR   | Task run 'download_file-44c' - Finished in state Crashed('Execution was aborted by Python system exit call.')
+02:31:07.033 | ERROR   | Flow run 'bouncy-kittiwake' - Crash detected! Execution was aborted by Python system exit call.
+02:31:07.076 | INFO    | Flow run 'bouncy-kittiwake' - Finished in state Crashed('Execution was aborted by Python system exit call.')
+02:31:07.077 | ERROR   | Flow run 'aquatic-jackal' - Crash detected! Execution was aborted by Python system exit call.
+02:31:07.090 | INFO    | Flow run 'aquatic-jackal' - Finished in state Crashed('Execution was aborted by Python system exit call.')
+ERROR: Не вдалося встановити з’єднання з FTP-сервером. Деталі: HTTPSConnectionPool(host='ftp.goit.study', port=443): Max retries exceeded with url: /neoversity/athlete_bio.csv (Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at 0x11448b7f0>, 'Connection to ftp.goit.study timed out. (connect timeout=30)'))
+02:31:07.124 | INFO    | prefect - Stopping temporary server on http://127.0.0.1:8887
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % 
+
+
+
+
+
+
+
+
+
+
+
