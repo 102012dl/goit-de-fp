@@ -1,0 +1,373 @@
+Нижче наведено інтегроване остаточне рішення для першої частини фінального проєкту – **Building an End-to-End Streaming Pipeline (Kafka + PySpark + MySQL)**. Це рішення складається з трьох файлів, які забезпечують автоматичне налаштування Kafka, потокову обробку даних за допомогою Spark і запис агрегованих результатів до MySQL. 
+
+Перед запуском переконайтеся, що:
+- **MySQL-сервер запущено** (наприклад, за допомогою Docker) та створено базу даних **olympic_dataset** (якщо її немає, створіть її, наприклад, через MySQL Workbench або CLI).
+- В базі даних **olympic_dataset** створено таблицю **athlete_stats** для запису агрегованих результатів (див. SQL‑скрипт у розділі «Попередні налаштування»).
+- У вас є файл **mysql-connector-j-8.0.32.jar** у папці (наприклад, `jars`), або вкажіть правильний шлях до нього.
+- Ви встановили залежність для роботи з Kafka у Spark через опцію **--packages**.
+
+---
+
+## Попередні налаштування
+
+### SQL для створення таблиці athlete_stats
+
+Перед запуском потоку створіть таблицю **athlete_stats** (якщо ви будете записувати результати у MySQL). Наприклад, виконайте наступний SQL‑запит через MySQL Workbench або CLI:
+
+```sql
+CREATE TABLE athlete_stats (
+    sport VARCHAR(255),
+    medal VARCHAR(255),
+    sex VARCHAR(50),
+    country_noc VARCHAR(50),
+    avg_height FLOAT,
+    avg_weight FLOAT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+```
+
+Також, якщо потрібно заповнити вихідні дані для тестування, окремим скриптом (populate_data.py) можна заповнити таблиці-джерела, однак ця частина не є обов’язковою для запуску стрімінгового рішення.
+
+---
+
+## Структура проєкту
+
+Наприклад, розташування файлів:
+```
+/Users/ihorfranchuk/PycharmProjects/PythonProject15/
+├── setup_kafka.sh
+├── streaming_pipeline.py
+└── run_first_part.sh
+└── jars/
+    └── mysql-connector-j-8.0.32.jar
+```
+
+---
+
+## Файл 1. setup_kafka.sh
+
+Цей скрипт перевіряє наявність curl і tar, завантажує Kafka версії 3.4.0 із archive.apache.org, розпаковує архів у домашню директорію та запускає ZooKeeper.
+
+```bash
+#!/bin/bash
+# ---------------------------------------
+# Автоматизований скрипт для налаштування Apache Kafka 3.4.0 на macOS
+# Використовує archive.apache.org як джерело завантаження tgz-архіву
+# ---------------------------------------
+
+# Перевірка наявності curl
+if ! command -v curl &> /dev/null; then
+    echo "ERROR: curl не встановлено. Встановіть curl і повторіть спробу."
+    exit 1
+fi
+
+# Перевірка наявності tar
+if ! command -v tar &> /dev/null; then
+    echo "ERROR: tar не встановлено. Встановіть tar і повторіть спробу."
+    exit 1
+fi
+
+# Налаштування змінних для Kafka (версія 3.4.0)
+KAFKA_VERSION="3.4.0"
+SCALA_VERSION="2.13"
+KAFKA_TGZ="kafka_${SCALA_VERSION}-${KAFKA_VERSION}.tgz"
+DOWNLOAD_URL="https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_${SCALA_VERSION}-${KAFKA_VERSION}.tgz"
+DEST_DIR="$HOME/kafka"  # Директорія для розпакування Kafka
+
+echo "=== Налаштування Apache Kafka для macOS (версія ${KAFKA_VERSION}) ==="
+echo "Завантаження Kafka з ${DOWNLOAD_URL} ..."
+
+if [ -d "$DEST_DIR" ]; then
+    echo "Kafka вже встановлено в $DEST_DIR"
+else
+    cd "$HOME" || { echo "Не вдалося перейти до $HOME"; exit 1; }
+    curl -L -o "$KAFKA_TGZ" "$DOWNLOAD_URL" || { echo "Помилка завантаження Kafka"; exit 1; }
+    echo "Розпакування архіву..."
+    tar -xzf "$KAFKA_TGZ" || { echo "Помилка розпакування архіву"; exit 1; }
+    mv "kafka_${SCALA_VERSION}-${KAFKA_VERSION}" "kafka" || { echo "Не вдалося перейменувати директорію Kafka"; exit 1; }
+    rm "$KAFKA_TGZ"
+    echo "Kafka встановлено в $DEST_DIR"
+fi
+
+cd "$DEST_DIR" || { echo "Не вдалося перейти до $DEST_DIR"; exit 1; }
+
+echo "Запуск ZooKeeper..."
+bin/zookeeper-server-start.sh -daemon config/zookeeper.properties
+sleep 5
+if pgrep -f "QuorumPeerMain" > /dev/null; then
+    echo "ZooKeeper успішно запущено."
+else
+    echo "Виникла проблема із запуском ZooKeeper."
+fi
+
+echo "----------------------------------------"
+echo "Для запуску Kafka-серверу використовуйте команду:"
+echo "  cd $DEST_DIR && ./bin/kafka-server-start.sh config/server.properties"
+echo "----------------------------------------"
+```
+
+---
+
+## Файл 2. streaming_pipeline.py
+
+Цей скрипт читає дані з MySQL (таблиця athlete_bio) та з Kafka‑топіка (athlete_event_results). Потім дані об’єднуються за athlete_id, групуються за sport, medal, sex, country_noc і обчислюється середнє значення для height і weight із додаванням часової мітки. Результати виводяться у консоль і записуються до таблиці **athlete_stats** у MySQL.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, avg, col, current_timestamp, to_json, concat_ws
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType
+
+# Налаштування підключення до MySQL
+jdbc_url = "jdbc:mysql://localhost:3306/olympic_dataset"
+jdbc_table_bio = "athlete_bio"
+jdbc_user = "root"                            # Для локального тестування використовується root
+jdbc_password = "your_root_password"          # Замініть на ваш фактичний пароль
+jdbc_driver = "com.mysql.cj.jdbc.Driver"
+jdbc_jar = "jars/mysql-connector-j-8.0.32.jar"
+
+# Налаштування Kafka
+kafka_bootstrap_servers = "localhost:9092"
+kafka_topic_results = "athlete_event_results"
+kafka_topic_output = "athlete_stats"  # Якщо потрібно записувати результати до Kafka
+
+# Створення Spark сесії з необхідною конфігурацією для підключення до Kafka
+spark = SparkSession.builder \
+    .config("spark.jars", jdbc_jar) \
+    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0") \
+    .appName("StreamingPipeline") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+# Схема для даних із Kafka (налаштуйте відповідно до вашого JSON)
+results_schema = StructType([
+    StructField("athlete_id", IntegerType()),
+    StructField("sport", StringType()),
+    StructField("medal", StringType()),
+    StructField("sex", StringType()),
+    StructField("country_noc", StringType())
+])
+
+# Зчитування даних із Kafka-топіка athlete_event_results
+df_stream_results = spark.readStream.format("kafka") \
+    .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
+    .option("subscribe", kafka_topic_results) \
+    .option("startingOffsets", "latest") \
+    .load() \
+    .select(from_json(col("value").cast("string"), results_schema).alias("results")) \
+    .select("results.*")
+
+# Зчитування даних з MySQL (таблиця athlete_bio)
+df_bio = spark.read.format("jdbc").options(
+    url=jdbc_url,
+    driver=jdbc_driver,
+    dbtable=jdbc_table_bio,
+    user=jdbc_user,
+    password=jdbc_password
+).load()
+
+# Фільтрація даних: залишаємо лише рядки, де height та weight не порожні та можуть бути приведені до числового типу
+df_bio_filtered = df_bio.filter(
+    (col("height").isNotNull()) & (col("weight").isNotNull()) &
+    (col("height").cast("int").isNotNull()) & (col("weight").cast("int").isNotNull())
+)
+
+# Об’єднання даних із потоку (Kafka) і з MySQL за athlete_id
+df_joined = df_stream_results.join(df_bio_filtered, "athlete_id")
+
+def process_batch(batch_df, batch_id):
+    # Групування за sport, medal, sex, country_noc із обчисленням середніх значень height та weight
+    df_aggregated = batch_df.groupBy("sport", "medal", "sex", "country_noc") \
+        .agg(avg("height").alias("avg_height"), avg("weight").alias("avg_weight")) \
+        .withColumn("timestamp", current_timestamp())
+    
+    print(f"Batch {batch_id} aggregated results:")
+    df_aggregated.show(truncate=False)
+    
+    # Запис агрегованих даних до MySQL (переконайтеся, що таблиця athlete_stats створена)
+    df_aggregated.write.format("jdbc") \
+        .option("url", jdbc_url) \
+        .option("driver", jdbc_driver) \
+        .option("dbtable", "athlete_stats") \
+        .option("user", jdbc_user) \
+        .option("password", jdbc_password) \
+        .mode("append") \
+        .save()
+    
+    print(f"Batch {batch_id} processed and written to MySQL.")
+
+# Запуск стрімінгової обробки з використанням foreachBatch
+query = df_joined.writeStream \
+    .outputMode("update") \
+    .foreachBatch(process_batch) \
+    .start()
+
+query.awaitTermination()
+```
+
+---
+
+## Файл 3. run_first_part.sh
+
+Цей bash‑скрипт інтегрує запуск усіх компонентів: він спочатку запускає Kafka (через setup_kafka.sh), перевіряє/запускає Kafka-сервер, а потім запускає PySpark стрімінгову джобу за допомогою spark-submit із завантаженням необхідних пакетів.
+
+```bash
+#!/bin/bash
+# ---------------------------------------
+# Інтегрований скрипт для запуску першої частини проєкту
+# ---------------------------------------
+
+# Переконайтеся, що ви у каталозі вашого проєкту, наприклад:
+# cd /Users/ihorfranchuk/PycharmProjects/PythonProject15
+
+echo "Запуск налаштування Apache Kafka..."
+./setup_kafka.sh
+
+# Перевірка, чи Kafka-сервер уже запущено (шукаємо процес KafkaServer)
+if pgrep -f "kafka.server.KafkaServer" > /dev/null; then
+    echo "Kafka-сервер вже запущено."
+else
+    echo "Запуск Kafka-серверу..."
+    cd "$HOME/kafka" || { echo "Не вдалося перейти до Kafka-директорії"; exit 1; }
+    ./bin/kafka-server-start.sh config/server.properties &
+    sleep 10
+fi
+
+# Повернення до каталозі проєкту
+cd - >/dev/null
+
+echo "Запуск PySpark стрімінгової джоби..."
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 streaming_pipeline.py
+```
+
+---
+
+## Інструкції з виконання у PyCharm (або Terminal)
+
+1. **Розмістіть файли:**
+   - Створіть новий проєкт або використайте існуючий у PyCharm, наприклад, за шляхом `/Users/ihorfranchuk/PycharmProjects/PythonProject15`.
+   - Додайте файли:  
+     • `setup_kafka.sh`  
+     • `streaming_pipeline.py`  
+     • `run_first_part.sh`  
+   - Переконайтеся, що у вашому проєкті існує папка `jars`, в якій знаходиться файл `mysql-connector-j-8.0.32.jar`.
+
+2. **Надайте права на виконання:**
+   В Terminal у PyCharm виконайте:
+   ```bash
+   cd /Users/ihorfranchuk/PycharmProjects/PythonProject15
+   chmod +x setup_kafka.sh streaming_pipeline.py run_first_part.sh
+   ```
+
+3. **Запустіть інтегрований скрипт:**
+   У Terminal, перебуваючи у каталозі проєкту, виконайте:
+   ```bash
+   ./run_first_part.sh
+   ```
+   Скрипт автоматично:
+   - Виконає `setup_kafka.sh` для завантаження і запуску ZooKeeper (якщо необхідно).
+   - Перевірить, чи запущено Kafka-сервер (і запустить його, якщо це потрібно).
+   - Виконає `spark-submit` для запуску файлу `streaming_pipeline.py` із завантаженням залежності `spark-sql-kafka-0-10_2.12:3.3.0`.
+
+4. **Перевірте результати:**
+   - Для кожного мікробатчу (batch) функція `process_batch` виведе агреговану таблицю у консоль і запише результати до таблиці **athlete_stats** у MySQL.
+   - Потім, використовуючи MySQL Workbench або CLI, виконайте:
+     ```sql
+     SELECT * FROM athlete_stats;
+     ```
+     щоб переглянути дані.
+
+---
+
+## Підсумок
+
+Цей інтегрований розв’язок включає:
+- Автоматичне налаштування і запуск Apache Kafka (через `setup_kafka.sh`),
+- Потокову обробку даних у PySpark із зчитуванням даних з MySQL (таблиця **athlete_bio**) та Kafka‑топіка **athlete_event_results**, об’єднання, агрегування та запис агрегованих даних до MySQL (таблиця **athlete_stats**) у файлі `streaming_pipeline.py`,
+- Запуск всіх компонентів через інтегрований скрипт `run_first_part.sh`.
+
+Дотримуйтеся наведеної інструкції для розміщення файлів у проєкті, надання прав і запуску з Terminal у PyCharm. Результатом виконання стане вивід агрегованої таблиці у консоль і запис даних до MySQL, що відповідає вимогам завдання.
+
+
+
+
+
+
+
++------------+------------------+--------+---------+---------+-------------+
+| athlete_id | name             | sex    | height  | weight  | country_noc |
++------------+------------------+--------+---------+---------+-------------+
+|          1 | Anna Lee         | Female |     160 |      55 | TPE         |
+|          2 | Maria Johnson    | Female |   168.4 |    55.4 | SWZ         |
+|          3 | Carlos Rodriguez | Male   |  172.25 | 66.4375 | CUB         |
+|          4 | Juan Martinez    | Male   |     174 |      65 | COL         |
+|          5 | Vera Novak       | Female |     170 |      68 | CZE         |
+|          6 | Miguel Hernandez | Male   |  176.15 |   70.55 | CUB         |
+|          7 | Li Wang          | Male   | 173.118 | 78.1176 | CHI         |
+|          8 | Ivana Petrovic   | Female | 168.921 | 66.2105 | CRO         |
+|          9 | Giorgi Tsiklauri | Male   | 178.474 | 78.8947 | GEO         |
+|         10 | Nino Kvitsiani   | Female | 166.636 | 59.7273 | GEO         |
+|         11 | Pablo Sanchez    | Male   |     190 |      86 | CHI         |
+|         12 | Jan Novak        | Male   | 189.415 |  88.561 | CZE         |
+|         13 | Petr Svoboda     | Male   |     188 |      77 | CZE         |
++------------+------------------+--------+---------+---------+-------------+
++-----------+--------------------------+------------+--------------+-------------+---------------------+------------+--------+
+| result_id | event                    | edition_id | edition      | country_noc | sport               | athlete_id | medal  |
++-----------+--------------------------+------------+--------------+-------------+---------------------+------------+--------+
+|       101 | Track Cycling Women      |       2021 | Tokyo 2020   | TPE         | CyclingTrack        |          1 | NULL   |
+|       102 | Athletics Women          |       2021 | Tokyo 2020   | SWZ         | Athletics           |          2 | NULL   |
+|       103 | Hockey Men               |       2021 | Tokyo 2020   | CUB         | Hockey              |          3 | NULL   |
+|       104 | Trampolining Men         |       2021 | Tokyo 2020   | COL         | Trampolining        |          4 | NULL   |
+|       105 | Shooting Women           |       2021 | Tokyo 2020   | CZE         | Shooting            |          5 | Silver |
+|       106 | Swimming Men             |       2021 | Tokyo 2020   | CUB         | Swimming            |          6 | NULL   |
+|       107 | Table Tennis Men         |       2021 | Tokyo 2020   | CHI         | TableTennis         |          7 | NULL   |
+|       108 | Alpine Skiing Women      |       2022 | Beijing 2022 | CRO         | AlpineSkiing        |          8 | NULL   |
+|       109 | Alpine Skiing Men        |       2022 | Beijing 2022 | GEO         | AlpineSkiing        |          9 | NULL   |
+|       110 | Alpine Skiing Women      |       2022 | Beijing 2022 | GEO         | AlpineSkiing        |         10 | NULL   |
+|       111 | Cross-Country Skiing Men |       2022 | Beijing 2022 | CHI         | CrossCountrySkiing  |         11 | NULL   |
+|       112 | Rowing Men               |       2021 | Tokyo 2020   | CZE         | Rowing              |         12 | NULL   |
+|       113 | Mountain Bike Men        |       2021 | Tokyo 2020   | CZE         | CyclingMountainBike |         13 | Gold   |
++-----------+--------------------------+------------+--------------+-------------+---------------------+------------+--------+
+ihorfranchuk@Ihors-MacBook-Pro ~ % 
+
+
+
+
+
+
+Підключення до MySQL серверу на localhost:3306...
+Вивід даних з таблиці athlete_bio:
+Columns: ['athlete_id', 'name', 'sex', 'height', 'weight', 'country_noc']
+(1, 'Anna Lee', 'Female', 160.0, 55.0, 'TPE')
+(2, 'Maria Johnson', 'Female', 168.4, 55.4, 'SWZ')
+(3, 'Carlos Rodriguez', 'Male', 172.25, 66.4375, 'CUB')
+(4, 'Juan Martinez', 'Male', 174.0, 65.0, 'COL')
+(5, 'Vera Novak', 'Female', 170.0, 68.0, 'CZE')
+(6, 'Miguel Hernandez', 'Male', 176.15, 70.55, 'CUB')
+(7, 'Li Wang', 'Male', 173.118, 78.1176, 'CHI')
+(8, 'Ivana Petrovic', 'Female', 168.921, 66.2105, 'CRO')
+(9, 'Giorgi Tsiklauri', 'Male', 178.474, 78.8947, 'GEO')
+(10, 'Nino Kvitsiani', 'Female', 166.636, 59.7273, 'GEO')
+(11, 'Pablo Sanchez', 'Male', 190.0, 86.0, 'CHI')
+(12, 'Jan Novak', 'Male', 189.415, 88.561, 'CZE')
+(13, 'Petr Svoboda', 'Male', 188.0, 77.0, 'CZE')
+
+------------------------
+
+Вивід даних з таблиці athlete_event_results:
+Columns: ['result_id', 'event', 'edition_id', 'edition', 'country_noc', 'sport', 'athlete_id', 'medal']
+(101, 'Track Cycling Women', 2021, 'Tokyo 2020', 'TPE', 'CyclingTrack', 1, None)
+(102, 'Athletics Women', 2021, 'Tokyo 2020', 'SWZ', 'Athletics', 2, None)
+(103, 'Hockey Men', 2021, 'Tokyo 2020', 'CUB', 'Hockey', 3, None)
+(104, 'Trampolining Men', 2021, 'Tokyo 2020', 'COL', 'Trampolining', 4, None)
+(105, 'Shooting Women', 2021, 'Tokyo 2020', 'CZE', 'Shooting', 5, 'Silver')
+(106, 'Swimming Men', 2021, 'Tokyo 2020', 'CUB', 'Swimming', 6, None)
+(107, 'Table Tennis Men', 2021, 'Tokyo 2020', 'CHI', 'TableTennis', 7, None)
+(108, 'Alpine Skiing Women', 2022, 'Beijing 2022', 'CRO', 'AlpineSkiing', 8, None)
+(109, 'Alpine Skiing Men', 2022, 'Beijing 2022', 'GEO', 'AlpineSkiing', 9, None)
+(110, 'Alpine Skiing Women', 2022, 'Beijing 2022', 'GEO', 'AlpineSkiing', 10, None)
+(111, 'Cross-Country Skiing Men', 2022, 'Beijing 2022', 'CHI', 'CrossCountrySkiing', 11, None)
+(112, 'Rowing Men', 2021, 'Tokyo 2020', 'CZE', 'Rowing', 12, None)
+(113, 'Mountain Bike Men', 2021, 'Tokyo 2020', 'CZE', 'CyclingMountainBike', 13, 'Gold')
+(.venv) ihorfranchuk@Ihors-MacBook-Pro PythonProject15 % 
+
